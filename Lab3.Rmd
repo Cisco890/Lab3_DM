@@ -1,8 +1,10 @@
-﻿---
+---
 title: "Laboratorio 3 - Descripcion de Variables"
 author: "Luis Pedro Lira 23669, Mario Rocha 23501, Juan Francisco Martinez 23617"
 date: "2026-03-12"
 output:
+  html_document:
+    df_print: paged
   pdf_document:
     latex_engine: xelatex
 editor_options:
@@ -169,4 +171,182 @@ quantile(precio_num, probs = c(0.9, 0.95, 0.99), na.rm = TRUE)
    - Reputacion y demanda: `number_of_reviews`, `review_scores_*`, `instant_bookable`.
 4. Variables de texto libre tienen informacion rica pero no se deben usar directamente sin transformacion.
 5. El siguiente paso natural es definir estrategia de preprocesamiento y particion entrenamiento/prueba para iniciar modelado reproducible.
+
+
+
+
+---
+--- ROCHA AQUI TENES QUE PONER EL ANALISIS EXPLORATORIO
+---
+
+
+## 8) Limpieza de la variable respuesta: price
+```{r limpiar-price}
+library(ggplot2)
+library(dplyr)
+
+datos$price_num <- suppressWarnings(
+  as.numeric(gsub("[^0-9\\.]", "", datos$price))
+)
+
+# Eliminar nulos y outliers extremos (por encima del percentil 99)
+p99 <- quantile(datos$price_num, 0.99, na.rm = TRUE)
+datos_clean <- datos %>%
+  filter(!is.na(price_num), price_num > 0, price_num <= p99)
+
+cat("Filas despues de limpiar price:", nrow(datos_clean), "\n")
+cat("Rango de price_num:", min(datos_clean$price_num), "-", max(datos_clean$price_num), "\n")
+
+ggplot(datos_clean, aes(x = price_num)) +
+  geom_histogram(bins = 60, fill = "#2c7fb8", color = "white") +
+  labs(
+    title = "Distribucion del precio (sin outliers extremos)",
+    x = "Precio (USD)",
+    y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** se eliminaron registros con precio nulo, cero o por encima del percentil 99 para reducir el efecto de outliers extremos que distorsionarian los modelos. La distribucion resultante muestra sesgo a la derecha tipico en precios de alquiler: la mayoria de propiedades se concentra en rangos bajos, con una cola larga hacia precios altos. Esto sugiere que una transformacion logaritmica podria ser util en el modelado.
+
+---
+
+## 9) Relacion entre variables numericas y el precio
+```{r correlacion-numericas}
+library(corrplot)
+
+vars_num_modelo <- c(
+  "price_num", "accommodates", "bedrooms", "beds",
+  "number_of_reviews", "review_scores_rating",
+  "review_scores_cleanliness", "review_scores_location",
+  "availability_365", "minimum_nights", "calculated_host_listings_count"
+)
+
+datos_cor <- datos_clean %>%
+  select(all_of(vars_num_modelo)) %>%
+  filter(complete.cases(.))
+
+cor_matrix <- cor(datos_cor)
+
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.cex = 0.75, addCoef.col = "black", number.cex = 0.6,
+         title = "Correlacion entre variables numericas y price_num",
+         mar = c(0,0,1,0))
+```
+
+**Analisis:** las variables con mayor correlacion positiva con el precio son `accommodates`, `bedrooms` y `beds`, lo cual tiene sentido: propiedades mas grandes y con mayor capacidad tienden a costar mas. Las variables de reviews muestran correlaciones debiles con el precio, lo que indica que la calificacion percibida no necesariamente se refleja en el precio cobrado. `availability_365` y `minimum_nights` tienen correlaciones muy bajas, sugiriendo que son menos utiles como predictores directos del precio.
+
+---
+
+## 10) Precio segun tipo de habitacion (room_type)
+```{r precio-room-type}
+datos_clean %>%
+  group_by(room_type) %>%
+  summarise(
+    n = n(),
+    mediana_precio = median(price_num, na.rm = TRUE),
+    media_precio = round(mean(price_num, na.rm = TRUE), 2)
+  ) %>%
+  arrange(desc(mediana_precio)) %>%
+  kable(caption = "Precio mediano y medio por room_type")
+
+ggplot(datos_clean, aes(x = reorder(room_type, price_num, median), y = price_num)) +
+  geom_boxplot(fill = "#41b6c4", outlier.alpha = 0.2) +
+  coord_flip() +
+  labs(
+    title = "Distribucion del precio por room_type",
+    x = "Tipo de habitacion",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** `Entire home/apt` tiene el precio mediano mas alto, seguido de `Hotel room` y luego `Private room` y `Shared room`. Esto confirma que el tipo de alojamiento es uno de los predictores categoricos mas importantes del precio: rentar una propiedad completa cuesta significativamente mas que compartir un espacio. Esta variable debera incluirse como dummy o factor en los modelos.
+
+---
+
+## 11) Precio segun numero de personas que puede alojar (accommodates)
+```{r precio-accommodates}
+ggplot(datos_clean %>% filter(accommodates <= 16),
+       aes(x = factor(accommodates), y = price_num)) +
+  geom_boxplot(fill = "#a1dab4", outlier.alpha = 0.15) +
+  labs(
+    title = "Precio segun capacidad de personas (accommodates)",
+    x = "Numero de personas",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** existe una tendencia clara y positiva: a mayor numero de personas que puede alojar la propiedad, mayor es el precio. Esta relacion es monotona y consistente, lo que la convierte en uno de los mejores predictores numericos continuos para los modelos de regresion. Propiedades para 10 o mas personas muestran mayor variabilidad, probablemente por diferencias en lujo y ubicacion.
+
+---
+
+## 12) Precio segun ciudad
+```{r precio-ciudad}
+top_ciudades <- datos_clean %>%
+  count(city, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(city)
+
+datos_clean %>%
+  filter(city %in% top_ciudades) %>%
+  group_by(city) %>%
+  summarise(
+    n = n(),
+    mediana_precio = median(price_num, na.rm = TRUE)
+  ) %>%
+  arrange(desc(mediana_precio)) %>%
+  kable(caption = "Precio mediano por ciudad (top 10 ciudades)")
+
+datos_clean %>%
+  filter(city %in% top_ciudades) %>%
+  ggplot(aes(x = reorder(city, price_num, median), y = price_num)) +
+  geom_boxplot(fill = "#fd8d3c", outlier.alpha = 0.1) +
+  coord_flip() +
+  labs(
+    title = "Distribucion del precio por ciudad (top 10)",
+    x = "Ciudad",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** existe variacion significativa en precios entre ciudades, lo que confirma que la ubicacion geografica es un predictor relevante. Ciudades como Nueva York o San Francisco tienden a tener precios medianos mas altos. Esta variable debera incluirse en los modelos, posiblemente como dummies de ciudad o usando el precio mediano de ciudad como feature numerico para evitar alta dimensionalidad.
+
+---
+
+## 13) Precio segun numero de resenas (number_of_reviews)
+```{r precio-reviews}
+ggplot(datos_clean %>% filter(number_of_reviews <= 200),
+       aes(x = number_of_reviews, y = price_num)) +
+  geom_point(alpha = 0.1, color = "#756bb1", size = 0.8) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+  labs(
+    title = "Precio vs Numero de resenas",
+    x = "Numero de resenas",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** la relacion entre numero de resenas y precio es debil y ligeramente negativa. Propiedades con muchas resenas no necesariamente son mas caras; de hecho, propiedades mas baratas tienden a tener mas rotacion y por ende mas resenas. Esto sugiere que `number_of_reviews` no sera un predictor fuerte del precio, aunque puede ser util para capturar popularidad de la propiedad.
+
+---
+
+## 14) Resumen: variables mas relacionadas con el precio
+```{r resumen-relaciones}
+correlaciones <- cor(datos_cor)[,"price_num"] %>%
+  sort(decreasing = TRUE) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(correlacion = ".") %>%
+  filter(variable != "price_num")
+
+kable(correlaciones, caption = "Correlacion de variables numericas con price_num")
+```
+
+**Analisis final:** las variables con mayor relacion lineal con el precio son `accommodates`, `bedrooms` y `beds`. Las variables de reviews tienen correlaciones muy bajas. Adicionalmente, los analisis graficos mostraron que `room_type` y `city` son predictores categoricos importantes. Para los modelos de regresion se priorizaran estas variables, complementadas con transformacion logaritmica del precio para corregir el sesgo en la distribucion.
+
+
 
