@@ -1,0 +1,172 @@
+﻿---
+title: "Laboratorio 3 - Descripcion de Variables"
+author: "Luis Pedro Lira 23669, Mario Rocha 23501, Juan Francisco Martinez 23617"
+date: "2026-03-12"
+output:
+  pdf_document:
+    latex_engine: xelatex
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+## 1) Carga del dataset y validacion basica
+
+```{r paquetes-y-carga}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+library(knitr)
+library(lubridate)
+
+load("listings.RData")
+datos <- listings
+
+dim(datos)
+```
+
+**Analisis:** el archivo `listings.RData` carga correctamente y contiene el objeto `listings`, que se usara como `datos`. El dataset tiene un tamano grande (171,748 filas y 80 columnas), por lo que hay suficiente informacion para construir modelos robustos, pero tambien aumenta la probabilidad de encontrar ruido, datos faltantes y formatos inconsistentes.
+
+## 2) Inventario y descripcion general de variables
+
+```{r inventario-variables}
+diccionario <- tibble(
+  variable = names(datos),
+  tipo = sapply(datos, function(x) class(x)[1]),
+  faltantes_n = sapply(datos, function(x) sum(is.na(x))),
+  faltantes_pct = round(sapply(datos, function(x) mean(is.na(x)) * 100), 2),
+  unicos_n = sapply(datos, function(x) n_distinct(x, na.rm = TRUE))
+) %>%
+  arrange(desc(faltantes_pct), variable)
+
+kable(head(diccionario, 25), caption = "Variables con mayor porcentaje de faltantes")
+```
+
+**Analisis:** se observa mezcla de variables numericas, enteras, logicas y de texto. Existen variables practicamente inutiles en su forma actual, por ejemplo `calendar_updated` (100% faltante). Tambien hay campos con faltantes altos (`estimated_revenue_l365d`, `price`, y varias `review_scores_*`), lo que sugiere que cualquier analisis posterior necesitara estrategia de imputacion, descarte o uso selectivo.
+
+## 3) Calidad de datos: faltantes y cardinalidad
+
+```{r faltantes-y-cardinalidad}
+faltantes_top <- diccionario %>%
+  slice_max(order_by = faltantes_pct, n = 20)
+
+ggplot(faltantes_top, aes(x = reorder(variable, faltantes_pct), y = faltantes_pct)) +
+  geom_col(fill = "#2c7fb8") +
+  coord_flip() +
+  labs(
+    title = "Top 20 variables con mas faltantes",
+    x = "Variable",
+    y = "Porcentaje faltante"
+  ) +
+  theme_minimal()
+
+cardinalidad_alta <- diccionario %>%
+  filter(tipo %in% c("character", "logical"), unicos_n > 50) %>%
+  arrange(desc(unicos_n))
+
+kable(head(cardinalidad_alta, 15), caption = "Variables categoricas/texto de alta cardinalidad")
+```
+
+**Analisis:** hay dos hallazgos importantes. Primero, faltantes concentrados en variables de negocio clave (precio, revenue y resenas), lo cual afecta la modelacion del precio. Segundo, muchas columnas de texto tienen cardinalidad extrema (`listing_url`, `name`, `amenities`, etc.); estas variables no conviene tratarlas como categoricas simples, sino mediante tecnicas de texto o extraccion de caracteristicas.
+
+## 4) Descripcion de variables numericas (resumen estadistico)
+
+```{r resumen-numericas}
+vars_numericas <- names(datos)[sapply(datos, is.numeric)]
+
+resumen_numericas <- lapply(vars_numericas, function(v) {
+  x <- datos[[v]]
+  tibble(
+    variable = v,
+    min = suppressWarnings(min(x, na.rm = TRUE)),
+    q1 = suppressWarnings(quantile(x, 0.25, na.rm = TRUE)),
+    mediana = suppressWarnings(median(x, na.rm = TRUE)),
+    media = suppressWarnings(mean(x, na.rm = TRUE)),
+    q3 = suppressWarnings(quantile(x, 0.75, na.rm = TRUE)),
+    max = suppressWarnings(max(x, na.rm = TRUE)),
+    faltantes_pct = round(mean(is.na(x)) * 100, 2)
+  )
+}) %>% bind_rows()
+
+kable(head(resumen_numericas, 15), caption = "Resumen de variables numericas (primeras 15)")
+```
+
+**Analisis:** las variables numericas muestran dispersion alta y posibles outliers fuertes (por ejemplo en conteos y noches maximas). Esto indica que en pasos posteriores sera util considerar transformaciones (logaritmicas o winsorizacion) para evitar que valores extremos dominen los modelos.
+
+## 5) Descripcion de variables categoricas clave
+
+```{r categoricas-clave}
+top_room <- sort(table(datos$room_type, useNA = "ifany"), decreasing = TRUE)
+top_property <- sort(table(datos$property_type, useNA = "ifany"), decreasing = TRUE)
+top_city <- sort(table(datos$city, useNA = "ifany"), decreasing = TRUE)
+
+kable(as.data.frame(top_room), col.names = c("room_type", "frecuencia"), caption = "Distribucion de room_type")
+kable(head(as.data.frame(top_property), 10), col.names = c("property_type", "frecuencia"), caption = "Top 10 property_type")
+kable(head(as.data.frame(top_city), 10), col.names = c("city", "frecuencia"), caption = "Top 10 city")
+```
+
+**Analisis:** la variable `room_type` esta fuertemente concentrada en `Entire home/apt`, seguida por `Private room`, lo cual sugiere segmentacion de mercado clara. En `property_type` y `city` tambien hay concentracion en pocos niveles; esto es util para modelar porque permite crear variables de agrupacion con poder explicativo real sobre el precio.
+
+## 6) Revision de fechas, precio y texto libre
+
+```{r fechas-precio-texto}
+datos_fechas <- datos %>%
+  mutate(
+    host_since_d = as.Date(host_since),
+    first_review_d = as.Date(first_review),
+    last_review_d = as.Date(last_review),
+    last_scraped_d = as.Date(last_scraped),
+    calendar_last_scraped_d = as.Date(calendar_last_scraped)
+  )
+
+fechas_resumen <- tibble(
+  variable = c("host_since", "first_review", "last_review", "last_scraped", "calendar_last_scraped"),
+  min = c(min(datos_fechas$host_since_d, na.rm = TRUE),
+          min(datos_fechas$first_review_d, na.rm = TRUE),
+          min(datos_fechas$last_review_d, na.rm = TRUE),
+          min(datos_fechas$last_scraped_d, na.rm = TRUE),
+          min(datos_fechas$calendar_last_scraped_d, na.rm = TRUE)),
+  max = c(max(datos_fechas$host_since_d, na.rm = TRUE),
+          max(datos_fechas$first_review_d, na.rm = TRUE),
+          max(datos_fechas$last_review_d, na.rm = TRUE),
+          max(datos_fechas$last_scraped_d, na.rm = TRUE),
+          max(datos_fechas$calendar_last_scraped_d, na.rm = TRUE)),
+  faltantes_pct = c(
+    round(mean(is.na(datos_fechas$host_since_d)) * 100, 2),
+    round(mean(is.na(datos_fechas$first_review_d)) * 100, 2),
+    round(mean(is.na(datos_fechas$last_review_d)) * 100, 2),
+    round(mean(is.na(datos_fechas$last_scraped_d)) * 100, 2),
+    round(mean(is.na(datos_fechas$calendar_last_scraped_d)) * 100, 2)
+  )
+)
+
+kable(fechas_resumen, caption = "Rango y faltantes de variables de fecha")
+
+precio_num <- suppressWarnings(as.numeric(gsub("[^0-9\\.]", "", datos$price)))
+
+summary(precio_num)
+quantile(precio_num, probs = c(0.9, 0.95, 0.99), na.rm = TRUE)
+```
+
+**Analisis:** las fechas cubren desde 2008 hasta finales de 2025, lo cual permite extraer variables temporales utiles (antiguedad del host, recencia de resenas). En `price` hay problemas de calidad: aunque es clave para prediccion, viene como texto y con alto faltante. Al convertirla a numerica aparecen NA adicionales por cadenas vacias, por lo que su limpieza sera una etapa critica del preprocesamiento.
+
+## 7) Conclusiones de la descripcion de variables
+
+1. El dataset es suficientemente grande y diverso para modelar precio, pero requiere limpieza fuerte.
+2. Las variables con faltantes muy altos (`calendar_updated`, parte de `review_scores_*`, `estimated_revenue_l365d`, `price`) deben tratarse con criterio estadistico y de negocio.
+3. Existen grupos de variables con potencial predictivo alto:
+   - Ubicacion: `city`, `neighbourhood_cleansed`, `latitude`, `longitude`.
+   - Capacidad y tipo de propiedad: `room_type`, `property_type`, `accommodates`, `bathrooms`, `bedrooms`, `beds`.
+   - Reputacion y demanda: `number_of_reviews`, `review_scores_*`, `instant_bookable`.
+4. Variables de texto libre tienen informacion rica pero no se deben usar directamente sin transformacion.
+5. El siguiente paso natural es definir estrategia de preprocesamiento y particion entrenamiento/prueba para iniciar modelado reproducible.
+
