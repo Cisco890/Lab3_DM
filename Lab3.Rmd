@@ -14,7 +14,7 @@ editor_options:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(
-  echo = TRUE,
+  echo = FALSE,
   message = FALSE,
   warning = FALSE
 )
@@ -175,12 +175,246 @@ quantile(precio_num, probs = c(0.9, 0.95, 0.99), na.rm = TRUE)
 
 
 
----
---- ROCHA AQUI TENES QUE PONER EL ANALISIS EXPLORATORIO
+## 8) Análisis Exploratorio de Datos (EDA)
+
+### 8.1) Distribución de la variable respuesta: price (cruda)
+```{r eda-price-crudo}
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# Convertir price a numérico sin limpiar aún
+price_raw <- suppressWarnings(
+  as.numeric(gsub("[^0-9\\.]", "", datos$price))
+)
+
+# Histograma precio crudo (con outliers)
+ggplot(data.frame(price = price_raw[!is.na(price_raw) & price_raw > 0]),
+       aes(x = price)) +
+  geom_histogram(bins = 80, fill = "#2c7fb8", color = "white", alpha = 0.85) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(
+    title = "Distribución del precio crudo (escala original)",
+    subtitle = "Se observa fuerte sesgo a la derecha con cola larga",
+    x = "Precio (USD)", y = "Frecuencia"
+  ) +
+  theme_minimal()
+
+# Histograma con transformación log
+ggplot(data.frame(price = price_raw[!is.na(price_raw) & price_raw > 0]),
+       aes(x = log1p(price))) +
+  geom_histogram(bins = 60, fill = "#41b6c4", color = "white", alpha = 0.85) +
+  labs(
+    title = "Distribución del precio con transformación log1p",
+    subtitle = "La distribución se aproxima a una normal → justifica usar log(price) en modelos",
+    x = "log(Precio + 1)", y = "Frecuencia"
+  ) +
+  theme_minimal()
+```
+
+**Análisis:** el precio en su escala original presenta un sesgo positivo (right-skewed) muy marcado, con una cola larga de propiedades de lujo con precios extremos. Al aplicar la transformación `log1p`, la distribución se aproxima a una forma aproximadamente normal, lo que es una condición deseable para modelos de regresión lineal. Esto justifica trabajar con `log(price)` como variable respuesta en la etapa de modelado.
+
 ---
 
+### 8.2) Distribuciones de variables numéricas clave
+```{r eda-numericas-dist}
+library(tidyr)
 
-## 8) Limpieza de la variable respuesta: price
+vars_eda <- c("accommodates", "bedrooms", "beds", 
+              "number_of_reviews", "review_scores_rating",
+              "minimum_nights", "availability_365")
+
+datos_long <- datos %>%
+  select(all_of(vars_eda)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "valor") %>%
+  filter(!is.na(valor))
+
+ggplot(datos_long, aes(x = valor)) +
+  geom_histogram(bins = 40, fill = "#2c7fb8", color = "white", alpha = 0.8) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Distribuciones de variables numéricas clave",
+    x = "Valor", y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(size = 8))
+```
+
+**Análisis:** varias variables numéricas muestran distribuciones fuertemente sesgadas a la derecha: `minimum_nights`, `number_of_reviews` y `availability_365` tienen colas largas con valores extremos. `accommodates`, `bedrooms` y `beds` están concentradas en valores bajos (1–4), lo cual es típico en Airbnb. `review_scores_rating` está concentrada en valores altos (cerca de 5), indicando que pocas propiedades tienen calificaciones bajas. En la etapa de preprocesamiento, variables con outliers extremos deberán ser winzorizadas o transformadas.
+
+---
+
+### 8.3) Análisis de outliers en variables numéricas clave
+```{r eda-outliers}
+vars_box <- c("accommodates", "bedrooms", "beds", "minimum_nights", "number_of_reviews")
+
+datos_box <- datos %>%
+  select(all_of(vars_box)) %>%
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "valor") %>%
+  filter(!is.na(valor))
+
+ggplot(datos_box, aes(x = variable, y = valor)) +
+  geom_boxplot(fill = "#fd8d3c", outlier.alpha = 0.15, outlier.size = 0.5) +
+  facet_wrap(~variable, scales = "free", ncol = 3) +
+  labs(
+    title = "Boxplots de variables numéricas clave",
+    subtitle = "Los puntos fuera del bigote representan outliers",
+    x = "", y = "Valor"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_blank())
+```
+
+**Análisis:** los boxplots confirman la presencia de outliers severos en varias variables. `minimum_nights` tiene casos extremos (más de 1000 noches mínimas, lo que puede ser un error de entrada o un listing mal configurado). `number_of_reviews` también tiene outliers altos que representan propiedades con historial muy largo. Estos valores deben tratarse con winsorizacion o filtrado antes del modelado para evitar que distorsionen los coeficientes.
+
+---
+
+### 8.4) Frecuencia de variables categóricas clave
+```{r eda-categoricas-freq}
+# Room type
+p1 <- datos %>%
+  filter(!is.na(room_type)) %>%
+  count(room_type, sort = TRUE) %>%
+  ggplot(aes(x = reorder(room_type, n), y = n)) +
+  geom_col(fill = "#756bb1", alpha = 0.85) +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Frecuencia por room_type", x = "", y = "Conteo") +
+  theme_minimal()
+
+# Property type (top 12)
+p2 <- datos %>%
+  filter(!is.na(property_type)) %>%
+  count(property_type, sort = TRUE) %>%
+  slice_head(n = 12) %>%
+  ggplot(aes(x = reorder(property_type, n), y = n)) +
+  geom_col(fill = "#41b6c4", alpha = 0.85) +
+  geom_text(aes(label = comma(n)), hjust = -0.1, size = 3) +
+  coord_flip() +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Top 12 property_type", x = "", y = "Conteo") +
+  theme_minimal()
+
+p1
+p2
+```
+
+**Análisis:** `room_type` está dominada por `Entire home/apt` (~70%+ de los listings), lo que implica que cualquier modelo tendrá predominantemente este perfil de propiedad. `Private room` es el segundo segmento. Esta concentración tiene implicación directa en el precio: el modelo verá mucho más de un tipo que otro, lo que puede sesgar predicciones para `Shared room` o `Hotel room` si no se segmenta o se balancea. En `property_type`, la categoría `Entire rental unit` y `Private room in rental unit` dominan, y las demás categorías tienen frecuencia suficiente para incluirlas agrupadas.
+
+---
+
+### 8.5) Relación entre accommodates y precio (scatter + tendencia)
+```{r eda-scatter-accommodates}
+price_raw_df <- datos %>%
+  mutate(price_num = suppressWarnings(as.numeric(gsub("[^0-9\\.]", "", price)))) %>%
+  filter(!is.na(price_num), price_num > 0, price_num <= quantile(price_num, 0.99, na.rm = TRUE),
+         !is.na(accommodates), accommodates <= 16)
+
+ggplot(price_raw_df, aes(x = accommodates, y = price_num)) +
+  geom_jitter(alpha = 0.05, color = "#2c7fb8", size = 0.6, width = 0.3) +
+  geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 1) +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Precio vs Capacidad de personas (accommodates)",
+    subtitle = "Relación positiva clara — más personas = mayor precio",
+    x = "Número de personas (accommodates)",
+    y = "Precio (USD)"
+  ) +
+  theme_minimal()
+```
+
+**Análisis:** la relación entre `accommodates` y `price_num` es positiva y consistente: a mayor capacidad, mayor precio. La línea de regresión confirma una tendencia lineal robusta. La dispersión aumenta para valores altos de `accommodates`, lo que sugiere que propiedades grandes tienen mayor variabilidad de precio (influenciada por factores como lujo, ubicación y amenidades). Esta variable es candidata fuerte para los modelos.
+
+---
+
+### 8.6) Precio mediano por room_type y property_type
+```{r eda-precio-categoricas}
+# Precio por room_type
+datos %>%
+  mutate(price_num = suppressWarnings(as.numeric(gsub("[^0-9\\.]", "", price)))) %>%
+  filter(!is.na(price_num), price_num > 0,
+         price_num <= quantile(price_num, 0.99, na.rm = TRUE),
+         !is.na(room_type)) %>%
+  ggplot(aes(x = reorder(room_type, price_num, median), y = price_num)) +
+  geom_boxplot(fill = "#a1dab4", outlier.alpha = 0.1, outlier.size = 0.5) +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Distribución del precio por room_type",
+    x = "Tipo de habitación", y = "Precio (USD)"
+  ) +
+  theme_minimal()
+
+# Precio mediano por property_type (top 10)
+datos %>%
+  mutate(price_num = suppressWarnings(as.numeric(gsub("[^0-9\\.]", "", price)))) %>%
+  filter(!is.na(price_num), price_num > 0,
+         price_num <= quantile(price_num, 0.99, na.rm = TRUE),
+         !is.na(property_type)) %>%
+  group_by(property_type) %>%
+  filter(n() >= 200) %>%
+  summarise(mediana_precio = median(price_num), n = n()) %>%
+  slice_max(mediana_precio, n = 12) %>%
+  ggplot(aes(x = reorder(property_type, mediana_precio), y = mediana_precio)) +
+  geom_col(fill = "#fd8d3c", alpha = 0.85) +
+  coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(
+    title = "Precio mediano por property_type (top 12, min 200 obs)",
+    x = "Tipo de propiedad", y = "Precio mediano (USD)"
+  ) +
+  theme_minimal()
+```
+
+**Análisis:** `Entire home/apt` tiene precio mediano significativamente más alto que `Private room` y `Shared room`. En `property_type`, categorías como `Entire villa`, `Entire cabin` o `Entire chalet` tienen precios medianos más altos que apartments o condos estándar. El filtro de mínimo 200 observaciones asegura que los medianos calculados sean estadísticamente representativos y no estén distorsionados por propiedades raras.
+
+---
+
+### 8.7) Matriz de correlación visual entre variables numéricas
+```{r eda-correlacion}
+library(corrplot)
+
+vars_cor_eda <- c("accommodates", "bedrooms", "beds", "bathrooms_text",
+                  "number_of_reviews", "review_scores_rating",
+                  "review_scores_cleanliness", "availability_365",
+                  "minimum_nights", "calculated_host_listings_count")
+
+# Solo numéricas válidas
+vars_cor_validas <- vars_cor_eda[sapply(vars_cor_eda, function(v) is.numeric(datos[[v]]))]
+
+datos_cor_eda <- datos %>%
+  select(all_of(vars_cor_validas)) %>%
+  filter(complete.cases(.))
+
+cor_eda <- cor(datos_cor_eda)
+
+corrplot(cor_eda,
+         method = "color",
+         type = "upper",
+         tl.cex = 0.75,
+         addCoef.col = "black",
+         number.cex = 0.6,
+         col = colorRampPalette(c("#2c7fb8", "white", "#d7301f"))(200),
+         title = "Correlación entre variables numéricas predictoras",
+         mar = c(0, 0, 1.5, 0))
+```
+
+**Análisis:** `accommodates`, `bedrooms` y `beds` están altamente correlacionadas entre sí (multicolinealidad esperada), lo que es lógico: propiedades más grandes tienen más camas y más cuartos. Esta colinealidad deberá manejarse en los modelos, especialmente en regresión lineal donde puede inflar varianzas de coeficientes. Las variables de reviews tienen correlaciones bajas entre sí y con las variables de capacidad, sugiriendo que aportan información complementaria.
+
+---
+
+### 8.8) Conclusiones del EDA
+
+1. **`price` requiere transformación logarítmica** antes del modelado: su distribución original es fuertemente sesgada a la derecha y `log1p(price)` se aproxima a una normal.
+2. **Las variables de capacidad** (`accommodates`, `bedrooms`, `beds`) son las mejores predictoras numéricas del precio, con relación positiva clara, pero presentan alta colinealidad entre sí.
+3. **`room_type` y `property_type`** son predictores categóricos de alto valor explicativo. Deben incluirse como dummies o factores en los modelos.
+4. **Outliers significativos** en `minimum_nights` y `number_of_reviews` requieren filtrado o winsorizacion antes del modelado.
+5. **`review_scores_rating` y `number_of_reviews`** tienen poca correlación con el precio, lo que sugiere que la popularidad o calidad percibida no determina el precio cobrado.
+6. El EDA valida y extiende las conclusiones de la sección 7: las variables de ubicación, capacidad y tipo de propiedad deben ser el núcleo del modelo predictivo.
+
+
+## 9) Limpieza de la variable respuesta: price
 ```{r limpiar-price}
 library(ggplot2)
 library(dplyr)
@@ -211,7 +445,7 @@ ggplot(datos_clean, aes(x = price_num)) +
 
 ---
 
-## 9) Relacion entre variables numericas y el precio
+## 10) Relacion entre variables numericas y el precio
 ```{r correlacion-numericas}
 library(corrplot)
 
@@ -238,7 +472,7 @@ corrplot(cor_matrix, method = "color", type = "upper",
 
 ---
 
-## 10) Precio segun tipo de habitacion (room_type)
+## 11) Precio segun tipo de habitacion (room_type)
 ```{r precio-room-type}
 datos_clean %>%
   group_by(room_type) %>%
@@ -265,7 +499,7 @@ ggplot(datos_clean, aes(x = reorder(room_type, price_num, median), y = price_num
 
 ---
 
-## 11) Precio segun numero de personas que puede alojar (accommodates)
+## 12) Precio segun numero de personas que puede alojar (accommodates)
 ```{r precio-accommodates}
 ggplot(datos_clean %>% filter(accommodates <= 16),
        aes(x = factor(accommodates), y = price_num)) +
@@ -282,7 +516,7 @@ ggplot(datos_clean %>% filter(accommodates <= 16),
 
 ---
 
-## 12) Precio segun ciudad
+## 13) Precio segun ciudad
 ```{r precio-ciudad}
 top_ciudades <- datos_clean %>%
   count(city, sort = TRUE) %>%
@@ -316,7 +550,7 @@ datos_clean %>%
 
 ---
 
-## 13) Precio segun numero de resenas (number_of_reviews)
+## 14) Precio segun numero de resenas (number_of_reviews)
 ```{r precio-reviews}
 ggplot(datos_clean %>% filter(number_of_reviews <= 200),
        aes(x = number_of_reviews, y = price_num)) +
@@ -334,7 +568,7 @@ ggplot(datos_clean %>% filter(number_of_reviews <= 200),
 
 ---
 
-## 14) Resumen: variables mas relacionadas con el precio
+## 15) Resumen: variables mas relacionadas con el precio
 ```{r resumen-relaciones}
 correlaciones <- cor(datos_cor)[,"price_num"] %>%
   sort(decreasing = TRUE) %>%
@@ -350,3 +584,5 @@ kable(correlaciones, caption = "Correlacion de variables numericas con price_num
 
 
 
+### LINK DE GITHUB
+https://github.com/Cisco890/Lab3_DM.git
