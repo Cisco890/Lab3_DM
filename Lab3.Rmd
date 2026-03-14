@@ -584,5 +584,311 @@ kable(correlaciones, caption = "Correlacion de variables numericas con price_num
 
 
 
+---
+
+## 16)  Preparacion analitica y dataset final de modelado
+
+Esta seccion formaliza el preprocesamiento para entregar un dataset de modelado reproducible al siguiente integrante.
+
+```{r parte1-pipeline-oficial}
+library(dplyr)
+library(stringr)
+library(lubridate)
+library(ggplot2)
+library(knitr)
+
+seed_split <- 23617
+set.seed(seed_split)
+reference_date <- as.Date("2025-12-31")
+
+skewness_simple <- function(x) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3) return(NA_real_)
+  s <- sd(x)
+  if (is.na(s) || s == 0) return(0)
+  mean(((x - mean(x)) / s)^3)
+}
+
+parse_pct <- function(x) {
+  suppressWarnings(as.numeric(str_remove(as.character(x), "%")) / 100)
+}
+
+parse_bathrooms <- function(x) {
+  txt <- str_to_lower(as.character(x))
+  out <- suppressWarnings(as.numeric(str_extract(txt, "[0-9]+(\\.[0-9]+)?")))
+  out[str_detect(txt, "half-bath")] <- 0.5
+  out
+}
+
+winsorize <- function(x, low, high) {
+  pmin(pmax(x, low), high)
+}
+
+scale_with <- function(df, center, scale) {
+  m <- as.matrix(df)
+  sweep(sweep(m, 2, center, "-"), 2, scale, "/")
+}
+
+assign_to_centers <- function(mat, centers) {
+  d <- sapply(seq_len(nrow(centers)), function(i) {
+    rowSums((mat - matrix(centers[i, ], nrow = nrow(mat), ncol = ncol(mat), byrow = TRUE))^2)
+  })
+  max.col(-d)
+}
+
+# 1) Limpieza oficial de price y construccion de variables derivadas
+modelo_raw <- datos %>%
+  mutate(
+    price_num = suppressWarnings(as.numeric(str_replace_all(price, "[^0-9\\.]", "")))
+  ) %>%
+  filter(!is.na(price_num), price_num > 0) %>%
+  mutate(
+    log_price = log(price_num),
+    host_since_date = suppressWarnings(as.Date(host_since)),
+    host_tenure_years = as.numeric(interval(host_since_date, reference_date) / years(1)),
+    host_response_rate_num = parse_pct(host_response_rate),
+    host_acceptance_rate_num = parse_pct(host_acceptance_rate),
+    bathrooms_num = ifelse(!is.na(bathrooms), as.numeric(bathrooms), parse_bathrooms(bathrooms_text)),
+    minimum_nights_log1p = log1p(minimum_nights),
+    number_of_reviews_log1p = log1p(number_of_reviews),
+    review_missing_flag = as.integer(is.na(review_scores_rating)),
+    response_missing_flag = as.integer(is.na(host_response_rate_num))
+  ) %>%
+  select(
+    log_price, price_num,
+    city, room_type, property_type, neighbourhood_cleansed,
+    host_is_superhost, host_identity_verified, instant_bookable,
+    accommodates, bathrooms_num, bedrooms, beds,
+    minimum_nights_log1p, maximum_nights, availability_365,
+    number_of_reviews_log1p, reviews_per_month, review_scores_rating,
+    host_tenure_years, host_response_rate_num, host_acceptance_rate_num,
+    calculated_host_listings_count, latitude, longitude,
+    review_missing_flag, response_missing_flag
+  )
+
+skew_resumen <- tibble(
+  variable = c("price_num", "log_price"),
+  skewness = round(c(
+    skewness_simple(modelo_raw$price_num),
+    skewness_simple(modelo_raw$log_price)
+  ), 3)
+)
+kable(skew_resumen, caption = "Decision oficial de respuesta: comparar sesgo en price vs log(price)")
+
+# 2) Split reproducible: 80/20 estratificado por city x room_type
+strata_split <- interaction(modelo_raw$city, modelo_raw$room_type, drop = TRUE)
+train_idx <- unlist(lapply(split(seq_len(nrow(modelo_raw)), strata_split), function(ids) {
+  n <- length(ids)
+  k <- max(1, floor(0.8 * n))
+  sample(ids, size = k)
+}))
+
+train_clean <- modelo_raw[train_idx, ]
+test_clean <- modelo_raw[-train_idx, ]
+
+split_info <- tibble(
+  dataset = c("train_clean", "test_clean"),
+  filas = c(nrow(train_clean), nrow(test_clean)),
+  proporcion = round(c(nrow(train_clean), nrow(test_clean)) / nrow(modelo_raw), 4)
+)
+kable(split_info, caption = "Particion final reproducible (seed = 23617)")
+
+# 3) Tratamiento de faltantes y categorias raras (aprendido solo con train)
+cat_vars <- c(
+  "city", "room_type", "property_type", "neighbourhood_cleansed",
+  "host_is_superhost", "host_identity_verified", "instant_bookable"
+)
+num_vars <- setdiff(names(train_clean), c("log_price", "price_num", cat_vars))
+
+min_count <- max(50, ceiling(0.005 * nrow(train_clean)))
+
+for (v in cat_vars) {
+  train_clean[[v]] <- as.character(train_clean[[v]])
+  test_clean[[v]] <- as.character(test_clean[[v]])
+
+  train_clean[[v]][is.na(train_clean[[v]]) | train_clean[[v]] == ""] <- "Unknown"
+  test_clean[[v]][is.na(test_clean[[v]]) | test_clean[[v]] == ""] <- "Unknown"
+
+  freq <- sort(table(train_clean[[v]]), decreasing = TRUE)
+  keep <- names(freq[freq >= min_count])
+
+  train_clean[[v]][!(train_clean[[v]] %in% keep)] <- "Other"
+  test_clean[[v]][!(test_clean[[v]] %in% keep)] <- "Other"
+
+  lvls <- sort(unique(c(train_clean[[v]], test_clean[[v]])))
+  train_clean[[v]] <- factor(train_clean[[v]], levels = lvls)
+  test_clean[[v]] <- factor(test_clean[[v]], levels = lvls)
+}
+
+train_clean <- train_clean %>%
+  rename(
+    property_type_group = property_type,
+    neighbourhood_group = neighbourhood_cleansed
+  )
+test_clean <- test_clean %>%
+  rename(
+    property_type_group = property_type,
+    neighbourhood_group = neighbourhood_cleansed
+  )
+
+cat_vars_final <- c(
+  "city", "room_type", "property_type_group", "neighbourhood_group",
+  "host_is_superhost", "host_identity_verified", "instant_bookable"
+)
+num_vars_final <- setdiff(names(train_clean), c("log_price", "price_num", cat_vars_final))
+
+medians_train <- sapply(train_clean[num_vars_final], function(x) median(x, na.rm = TRUE))
+for (v in num_vars_final) {
+  train_clean[[v]][is.na(train_clean[[v]])] <- medians_train[[v]]
+  test_clean[[v]][is.na(test_clean[[v]])] <- medians_train[[v]]
+}
+
+# 4) Tratamiento de outliers: winsor 1%-99% en variables sesgadas
+winsor_vars <- c(
+  "maximum_nights", "availability_365", "calculated_host_listings_count",
+  "reviews_per_month", "host_tenure_years"
+)
+
+train_before_w <- train_clean[winsor_vars]
+test_before_w <- test_clean[winsor_vars]
+winsor_lims <- lapply(winsor_vars, function(v) quantile(train_clean[[v]], probs = c(0.01, 0.99), na.rm = TRUE))
+names(winsor_lims) <- winsor_vars
+
+for (v in winsor_vars) {
+  low <- winsor_lims[[v]][1]
+  high <- winsor_lims[[v]][2]
+  train_clean[[v]] <- winsorize(train_clean[[v]], low, high)
+  test_clean[[v]] <- winsorize(test_clean[[v]], low, high)
+}
+
+outlier_resumen <- tibble(
+  variable = winsor_vars,
+  p01_train = round(sapply(winsor_lims, function(x) x[1]), 3),
+  p99_train = round(sapply(winsor_lims, function(x) x[2]), 3),
+  clips_train = sapply(winsor_vars, function(v) sum(train_before_w[[v]] < winsor_lims[[v]][1] | train_before_w[[v]] > winsor_lims[[v]][2])),
+  clips_test = sapply(winsor_vars, function(v) sum(test_before_w[[v]] < winsor_lims[[v]][1] | test_before_w[[v]] > winsor_lims[[v]][2]))
+)
+kable(outlier_resumen, caption = "Tratamiento de outliers aplicado con cuantiles de train")
+
+# 5) Segmentacion por clustering (k-means) para explicar grupos de listings
+cluster_features <- c(
+  "accommodates", "bathrooms_num", "bedrooms", "beds",
+  "minimum_nights_log1p", "availability_365",
+  "number_of_reviews_log1p", "review_scores_rating", "host_tenure_years"
+)
+
+center_train <- sapply(train_clean[cluster_features], mean)
+scale_train <- sapply(train_clean[cluster_features], sd)
+scale_train[scale_train == 0] <- 1
+
+train_scaled <- scale_with(train_clean[cluster_features], center_train, scale_train)
+test_scaled <- scale_with(test_clean[cluster_features], center_train, scale_train)
+
+set.seed(seed_split)
+sample_idx <- sample(seq_len(nrow(train_scaled)), min(25000, nrow(train_scaled)))
+wss_grid <- sapply(2:7, function(k) {
+  kmeans(train_scaled[sample_idx, ], centers = k, nstart = 15, iter.max = 100)$tot.withinss
+})
+
+elbow_df <- tibble(k = 2:7, wss = wss_grid)
+ggplot(elbow_df, aes(x = k, y = wss)) +
+  geom_line(color = "#2c7fb8", linewidth = 1) +
+  geom_point(color = "#2c7fb8", size = 2) +
+  scale_x_continuous(breaks = 2:7) +
+  labs(
+    title = "Elbow method en muestra de train",
+    subtitle = "Se selecciona k = 4 por balance entre ajuste e interpretabilidad",
+    x = "Numero de clusters (k)",
+    y = "Within-cluster sum of squares"
+  ) +
+  theme_minimal()
+
+set.seed(seed_split)
+km_model <- kmeans(train_scaled[sample_idx, ], centers = 4, nstart = 30, iter.max = 120)
+segment_levels <- as.character(1:4)
+train_clean$segment_id <- factor(assign_to_centers(train_scaled, km_model$centers), levels = segment_levels)
+test_clean$segment_id <- factor(assign_to_centers(test_scaled, km_model$centers), levels = segment_levels)
+
+segment_profile <- bind_rows(
+  train_clean %>% mutate(split = "train"),
+  test_clean %>% mutate(split = "test")
+) %>%
+  group_by(segment_id) %>%
+  summarise(
+    n = n(),
+    pct_total = round(100 * n() / (nrow(train_clean) + nrow(test_clean)), 2),
+    precio_geometrico = round(exp(mean(log_price)), 2),
+    accommodates_prom = round(mean(accommodates), 2),
+    bedrooms_prom = round(mean(bedrooms), 2),
+    bathrooms_prom = round(mean(bathrooms_num), 2),
+    review_rating_prom = round(mean(review_scores_rating), 2),
+    availability_prom = round(mean(availability_365), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(precio_geometrico)) %>%
+  mutate(
+    interpretacion = case_when(
+      precio_geometrico >= quantile(precio_geometrico, 0.75) ~ "Segmento premium: alta capacidad y mayor precio esperado.",
+      precio_geometrico >= median(precio_geometrico) ~ "Segmento medio-alto: unidades completas con precio intermedio.",
+      TRUE ~ "Segmento economico: menor precio y menor capacidad relativa."
+    )
+  )
+kable(segment_profile, caption = "Perfil de grupos y efecto esperado sobre precio")
+
+# 6) Objetos finales solicitados para Parte 2
+train_clean <- train_clean %>% select(-price_num)
+test_clean <- test_clean %>% select(-price_num)
+
+response_var <- "log_price"
+predictor_set <- setdiff(names(train_clean), response_var)
+
+variables_descartadas <- tibble(
+  variable = c(
+    "id", "listing_url", "scrape_id", "last_scraped",
+    "name", "description", "neighborhood_overview", "host_about",
+    "amenities", "calendar_updated", "estimated_revenue_l365d", "license"
+  ),
+  razon = c(
+    "Identificador unico, no predictivo.",
+    "URL unica (alta cardinalidad, irrelevante para precio).",
+    "Metadato tecnico del scraping.",
+    "Fecha de scraping, no representa valor intrinseco del listing.",
+    "Texto libre de alta cardinalidad.",
+    "Texto libre sin vectorizacion en esta fase.",
+    "Texto libre sin vectorizacion en esta fase.",
+    "Texto libre sin vectorizacion en esta fase.",
+    "Texto semi-estructurado de muy alta cardinalidad (se reserva para NLP).",
+    "100% faltante.",
+    "Variable con 55%+ faltantes y potencial fuga temporal.",
+    "Cobertura incompleta y reglas heterogeneas por ciudad."
+  )
+)
+
+resumen_final <- tibble(
+  dataset = c("train_clean", "test_clean"),
+  filas = c(nrow(train_clean), nrow(test_clean)),
+  columnas = c(ncol(train_clean), ncol(test_clean)),
+  n_na = c(sum(is.na(train_clean)), sum(is.na(test_clean)))
+)
+kable(resumen_final, caption = "Datasets finales limpios listos para modelado")
+kable(tibble(predictor = predictor_set), caption = "Set final de variables candidatas")
+kable(variables_descartadas, caption = "Variables descartadas y justificacion")
+
+save(train_clean, test_clean, response_var, predictor_set, segment_profile,
+     file = "parte2_datasets_limpios.RData")
+```
+
+**Explicacion ejecutiva del preprocesamiento:**
+1. `price` se limpio de simbolos y comas; se eliminaron precios no validos (`NA` o `<= 0`).
+2. La respuesta oficial es `log_price` porque reduce el sesgo de cola larga y estabiliza varianza.
+3. Se uso split `80/20` estratificado por `city x room_type` con `seed = 23617` para mantener representatividad geografica y de tipo de alojamiento.
+4. Faltantes numericos se imputaron con mediana de train; categoricos se imputaron como `Unknown`.
+5. Categorias raras se agruparon en `Other` con umbral minimo de frecuencia para evitar niveles inestables.
+6. Outliers en predictores sesgados se winsorizaron al rango `p01-p99` aprendido en train.
+7. Se hizo clustering k-means (`k = 4`) para segmentar listings y agregar `segment_id` como variable explicativa adicional.
+8. Se generaron y guardaron los entregables de Parte 2: `train_clean`, `test_clean`, `response_var`, `predictor_set`.
+
+
+
 ### LINK DE GITHUB
 https://github.com/Cisco890/Lab3_DM.git
