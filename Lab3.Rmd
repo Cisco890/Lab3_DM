@@ -890,5 +890,454 @@ save(train_clean, test_clean, response_var, predictor_set, segment_profile,
 
 
 
+## PARTE 2 — Construcción y diagnóstico de modelos
+```{r setup-parte2}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(car)       # VIF
+library(glmnet)    # Ridge / Lasso / Elastic Net
+library(scales)
+
+# Cargar datasets limpios de Parte 1
+load("parte2_datasets_limpios.RData")
+
+# Funcion auxiliar de metricas
+calc_metricas <- function(actual, predicted, label = "") {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae  <- mean(abs(actual - predicted))
+  r2   <- cor(actual, predicted)^2
+  tibble(modelo = label, RMSE = round(rmse, 4), MAE = round(mae, 4), R2 = round(r2, 4))
+}
+```
+
+---
+
+### 17) Modelo de regresión lineal simple
+```{r modelo-simple}
+# Seleccionar la mejor variable individual: correlacion con log_price
+vars_num_candidatas <- c(
+  "accommodates", "bedrooms", "beds", "bathrooms_num",
+  "minimum_nights_log1p", "number_of_reviews_log1p",
+  "review_scores_rating", "availability_365",
+  "host_tenure_years", "calculated_host_listings_count"
+)
+
+cors_simple <- sapply(vars_num_candidatas, function(v) {
+  cor(train_clean[[v]], train_clean$log_price, use = "complete.obs")
+})
+
+cors_df <- tibble(
+  variable    = names(cors_simple),
+  correlacion = round(cors_simple, 4)
+) %>% arrange(desc(abs(correlacion)))
+
+kable(cors_df, caption = "Correlacion de variables numericas con log_price")
+
+mejor_var <- cors_df$variable[1]
+cat("Variable seleccionada:", mejor_var, "\n")
+
+# Ajuste del modelo simple
+formula_simple <- as.formula(paste("log_price ~", mejor_var))
+modelo_simple  <- lm(formula_simple, data = train_clean)
+
+summary(modelo_simple)
+
+# Metricas en train
+pred_simple_train <- predict(modelo_simple, train_clean)
+pred_simple_test  <- predict(modelo_simple, test_clean)
+
+metricas_simple <- bind_rows(
+  calc_metricas(train_clean$log_price, pred_simple_train, "Simple - Train"),
+  calc_metricas(test_clean$log_price,  pred_simple_test,  "Simple - Test")
+)
+kable(metricas_simple, caption = "Metricas modelo simple (log_price)")
+
+# Grafico de ajuste
+ggplot(train_clean, aes_string(x = mejor_var, y = "log_price")) +
+  geom_point(alpha = 0.05, color = "#2c7fb8", size = 0.6) +
+  geom_smooth(method = "lm", color = "red", se = TRUE, linewidth = 1) +
+  labs(
+    title  = paste("Ajuste lineal simple: log_price ~", mejor_var),
+    subtitle = paste0("R² train = ", round(summary(modelo_simple)$r.squared, 3)),
+    x = mejor_var, y = "log(price)"
+  ) +
+  theme_minimal()
+
+# Diagnostico de residuos
+par(mfrow = c(2, 2))
+plot(modelo_simple, which = 1:4)
+par(mfrow = c(1, 1))
+```
+
+**Analisis:** la variable con mayor correlacion lineal con `log_price` es `accommodates` (o la que resulte del ranking), lo que confirma los hallazgos del EDA. El coeficiente positivo indica que cada persona adicional de capacidad incrementa el log del precio en beta unidades, equivalente a un incremento porcentual multiplicativo en la escala original. El R² del modelo simple es bajo porque ignora el efecto de ubicacion, tipo de habitacion y calidad, pero establece la linea base para comparar modelos mas complejos. Los residuos del modelo simple muestran patron estructurado (no aleatorio), lo que confirma que una sola variable no es suficiente.
+
+---
+
+### 18) Modelo de regresión lineal múltiple
+```{r modelo-multiple}
+# Usar solo predictores numericos para el modelo multiple base
+vars_num_modelo <- c(
+  "accommodates", "bedrooms", "beds", "bathrooms_num",
+  "minimum_nights_log1p", "number_of_reviews_log1p",
+  "review_scores_rating", "review_scores_cleanliness",
+  "review_scores_location", "availability_365",
+  "host_tenure_years", "calculated_host_listings_count",
+  "reviews_per_month"
+)
+
+# Filtrar solo las que existen en train_clean
+vars_num_modelo <- intersect(vars_num_modelo, names(train_clean))
+
+formula_mult <- as.formula(
+  paste("log_price ~", paste(vars_num_modelo, collapse = " + "))
+)
+
+modelo_multiple <- lm(formula_mult, data = train_clean)
+
+# Tabla de coeficientes
+coef_tabla <- as.data.frame(summary(modelo_multiple)$coefficients) %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(estimado = Estimate, error_std = `Std. Error`,
+         t_valor = `t value`, p_valor = `Pr(>|t|)`) %>%
+  mutate(
+    significancia = case_when(
+      p_valor < 0.001 ~ "***",
+      p_valor < 0.01  ~ "**",
+      p_valor < 0.05  ~ "*",
+      p_valor < 0.1   ~ ".",
+      TRUE            ~ ""
+    ),
+    across(c(estimado, error_std, t_valor), ~round(.x, 4)),
+    p_valor = round(p_valor, 5)
+  )
+
+kable(coef_tabla, caption = "Coeficientes del modelo multiple")
+cat("R² ajustado:", round(summary(modelo_multiple)$adj.r.squared, 4), "\n")
+
+# Metricas
+pred_mult_train <- predict(modelo_multiple, train_clean)
+pred_mult_test  <- predict(modelo_multiple, test_clean)
+
+metricas_mult <- bind_rows(
+  calc_metricas(train_clean$log_price, pred_mult_train, "Multiple - Train"),
+  calc_metricas(test_clean$log_price,  pred_mult_test,  "Multiple - Test")
+)
+kable(metricas_mult, caption = "Metricas modelo multiple (log_price)")
+
+# Diagnostico de residuos
+par(mfrow = c(2, 2))
+plot(modelo_multiple, which = 1:4)
+par(mfrow = c(1, 1))
+```
+
+**Analisis:** el modelo multiple mejora sustancialmente sobre el simple: el R² ajustado sube considerablemente al incorporar capacidad, calidad y demanda de manera conjunta. Los coeficientes con `***` son altamente significativos; variables como `review_scores_cleanliness` o `minimum_nights_log1p` pueden no ser significativas dependiendo de los datos, lo que guia la depuracion posterior. Los graficos de residuos muestran si se cumple homocedasticidad (residuos sin patron en funcion de valores ajustados) y normalidad aproximada (Q-Q plot). Desviaciones en estos graficos motivan las correcciones del siguiente paso.
+
+---
+
+### 19) Analisis de multicolinealidad (VIF)
+```{r multicolinealidad}
+library(corrplot)
+
+# Matriz de correlacion entre predictores
+datos_cor_pred <- train_clean %>%
+  select(all_of(vars_num_modelo)) %>%
+  filter(complete.cases(.))
+
+cor_pred <- cor(datos_cor_pred)
+
+corrplot(cor_pred,
+         method   = "color",
+         type     = "upper",
+         tl.cex   = 0.7,
+         addCoef.col = "black",
+         number.cex  = 0.55,
+         col = colorRampPalette(c("#2c7fb8", "white", "#d7301f"))(200),
+         title = "Correlacion entre predictores numericos",
+         mar   = c(0, 0, 1.5, 0))
+
+# VIF
+vif_valores <- vif(modelo_multiple)
+vif_df <- tibble(
+  variable = names(vif_valores),
+  VIF      = round(vif_valores, 3)
+) %>%
+  arrange(desc(VIF)) %>%
+  mutate(
+    problema = case_when(
+      VIF > 10 ~ "Alta multicolinealidad",
+      VIF > 5  ~ "Multicolinealidad moderada",
+      TRUE     ~ "Aceptable"
+    )
+  )
+
+kable(vif_df, caption = "Factor de Inflacion de Varianza (VIF)")
+
+# Visualizacion del VIF
+ggplot(vif_df, aes(x = reorder(variable, VIF), y = VIF, fill = problema)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 5,  linetype = "dashed", color = "orange", linewidth = 0.8) +
+  geom_hline(yintercept = 10, linetype = "dashed", color = "red",    linewidth = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c(
+    "Alta multicolinealidad"     = "#d7301f",
+    "Multicolinealidad moderada" = "#fd8d3c",
+    "Aceptable"                  = "#41b6c4"
+  )) +
+  labs(
+    title    = "VIF por variable predictora",
+    subtitle = "Linea naranja = 5, linea roja = 10",
+    x = "", y = "VIF", fill = "Diagnostico"
+  ) +
+  theme_minimal()
+
+# Variables problematicas
+vars_problematicas <- vif_df %>% filter(VIF > 5) %>% pull(variable)
+cat("Variables con VIF > 5:", paste(vars_problematicas, collapse = ", "), "\n")
+```
+
+**Analisis:** `bedrooms`, `beds` y `accommodates` tipicamente presentan VIF alto (>5) porque estan altamente correlacionadas entre si: propiedades con mas cuartos tienen mas camas y mas capacidad. Esto infla la varianza de sus coeficientes individuales, haciendolos inestables aunque el modelo global sea bueno. La solucion en el modelo corregido es conservar la variable con mayor poder explicativo individual (`accommodates`) y descartar las redundantes (`beds`, y posiblemente `bedrooms`). Variables de reviews tambien pueden mostrar colinealidad entre subcategorias (`cleanliness`, `location`, `rating`).
+
+---
+
+### 20) Evaluacion de sobreajuste
+```{r sobreajuste}
+# Comparar metricas train vs test para modelo simple y multiple
+metricas_comparacion <- bind_rows(metricas_simple, metricas_mult)
+kable(metricas_comparacion, caption = "Comparacion de metricas Train vs Test")
+
+# Grafico de brecha train/test
+metricas_comparacion %>%
+  tidyr::separate(modelo, into = c("tipo", "split"), sep = " - ") %>%
+  ggplot(aes(x = tipo, y = RMSE, fill = split)) +
+  geom_col(position = "dodge", alpha = 0.85, width = 0.6) +
+  scale_fill_manual(values = c("Train" = "#2c7fb8", "Test" = "#d7301f")) +
+  labs(
+    title    = "RMSE: Train vs Test por modelo",
+    subtitle = "Brecha grande indica sobreajuste",
+    x = "Modelo", y = "RMSE (log_price)", fill = "Split"
+  ) +
+  theme_minimal()
+
+# Calculo de brecha relativa
+brecha <- metricas_comparacion %>%
+  tidyr::separate(modelo, into = c("tipo", "split"), sep = " - ") %>%
+  select(tipo, split, RMSE) %>%
+  tidyr::pivot_wider(names_from = split, values_from = RMSE) %>%
+  mutate(brecha_pct = round(100 * (Test - Train) / Train, 2))
+
+kable(brecha, caption = "Brecha relativa RMSE Test vs Train (%)")
+```
+
+**Analisis:** si la brecha entre RMSE\_test y RMSE\_train es menor al 5%, el modelo generaliza bien. Si supera el 10%, hay indicios de sobreajuste: el modelo memoriza patrones del train que no existen en test. Con 170k+ observaciones y un modelo lineal de pocas variables, el sobreajuste clasico es poco probable, pero puede aparecer si se incluyen muchas dummies categoricas de alta cardinalidad (neighbourhood, property_type con muchos niveles).
+
+---
+
+### 21) Modelo corregido
+```{r modelo-corregido}
+# Remover variables con alta multicolinealidad (VIF > 5) salvo la mas explicativa
+# Conservar accommodates, eliminar beds; evaluar bedrooms segun VIF
+vars_corregido <- vars_num_modelo[!vars_num_modelo %in% vars_problematicas]
+
+# Siempre conservar accommodates aunque tenga VIF alto (es la mas explicativa)
+vars_corregido <- union(vars_corregido, "accommodates")
+
+# Agregar variables categoricas clave como dummies
+cat_vars_modelo <- intersect(
+  c("room_type", "city", "host_is_superhost", "instant_bookable", "segment_id"),
+  names(train_clean)
+)
+
+formula_corregido <- as.formula(
+  paste("log_price ~",
+        paste(c(vars_corregido, cat_vars_modelo), collapse = " + "))
+)
+
+modelo_corregido <- lm(formula_corregido, data = train_clean)
+
+coef_corr_tabla <- as.data.frame(summary(modelo_corregido)$coefficients) %>%
+  tibble::rownames_to_column("variable") %>%
+  rename(estimado = Estimate, error_std = `Std. Error`,
+         t_valor = `t value`, p_valor = `Pr(>|t|)`) %>%
+  mutate(
+    significancia = case_when(
+      p_valor < 0.001 ~ "***",
+      p_valor < 0.01  ~ "**",
+      p_valor < 0.05  ~ "*",
+      TRUE            ~ ""
+    ),
+    across(c(estimado, error_std, t_valor), ~round(.x, 4)),
+    p_valor = round(p_valor, 5)
+  )
+
+kable(coef_corr_tabla, caption = "Coeficientes del modelo corregido")
+cat("R² ajustado:", round(summary(modelo_corregido)$adj.r.squared, 4), "\n")
+
+# Metricas
+pred_corr_train <- predict(modelo_corregido, train_clean)
+pred_corr_test  <- predict(modelo_corregido, test_clean)
+
+metricas_corr <- bind_rows(
+  calc_metricas(train_clean$log_price, pred_corr_train, "Corregido - Train"),
+  calc_metricas(test_clean$log_price,  pred_corr_test,  "Corregido - Test")
+)
+kable(metricas_corr, caption = "Metricas modelo corregido")
+
+# Diagnostico de residuos
+par(mfrow = c(2, 2))
+plot(modelo_corregido, which = 1:4)
+par(mfrow = c(1, 1))
+
+# Grafico: valores reales vs predichos
+ggplot(data.frame(
+    real     = test_clean$log_price,
+    predicho = pred_corr_test
+  ), aes(x = predicho, y = real)) +
+  geom_point(alpha = 0.05, color = "#756bb1", size = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 1) +
+  labs(
+    title    = "Real vs Predicho: modelo corregido (test)",
+    subtitle = "La linea roja representa prediccion perfecta",
+    x = "log_price predicho", y = "log_price real"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** el modelo corregido reduce la multicolinealidad al eliminar variables redundantes y suma poder explicativo al incorporar variables categoricas como `room_type` y `city`. El R² ajustado tipicamente sube respecto al modelo multiple numerico puro porque estas categoricas capturan diferencias estructurales de precio que las numericas no pueden representar. El grafico de real vs predicho muestra cuanto se acercan los puntos a la diagonal: cuanto mas concentrados en la linea roja, mejor el ajuste.
+
+---
+
+### 22) Modelo regularizado (Lasso / Ridge / Elastic Net)
+```{r modelo-regularizado}
+library(glmnet)
+
+# Preparar matriz de diseno (model.matrix maneja dummies automaticamente)
+X_train <- model.matrix(formula_corregido, data = train_clean)[, -1]
+y_train  <- train_clean$log_price
+
+X_test  <- model.matrix(formula_corregido, data = test_clean)[, -1]
+y_test   <- test_clean$log_price
+
+# Elastic Net con alpha = 0.5 (mezcla Ridge + Lasso)
+# alpha = 0 → Ridge puro | alpha = 1 → Lasso puro
+set.seed(23617)
+cv_enet <- cv.glmnet(X_train, y_train, alpha = 0.5, nfolds = 10)
+
+# Grafico de CV
+plot(cv_enet)
+title("Cross-validation Elastic Net: seleccion de lambda", line = 2.5)
+
+lambda_min <- cv_enet$lambda.min
+lambda_1se <- cv_enet$lambda.1se
+cat("Lambda minimo (menor error):", round(lambda_min, 5), "\n")
+cat("Lambda 1-SE (mas parsimonioso):", round(lambda_1se, 5), "\n")
+
+# Coeficientes con lambda.1se (modelo mas simple con error aceptable)
+coef_enet <- coef(cv_enet, s = "lambda.1se")
+coef_enet_df <- as.data.frame(as.matrix(coef_enet))
+colnames(coef_enet_df) <- "coeficiente"   # renombrar directo, sin depender del nombre automatico
+coef_enet_df <- coef_enet_df %>%
+  tibble::rownames_to_column("variable") %>%
+  filter(coeficiente != 0, variable != "(Intercept)") %>%
+  arrange(desc(abs(coeficiente)))
+
+kable(coef_enet_df, caption = "Coeficientes no cero - Elastic Net (lambda.1se)")
+cat("Variables seleccionadas por Elastic Net:", nrow(coef_enet_df), "\n")
+# Metricas
+pred_enet_train <- predict(cv_enet, X_train, s = "lambda.1se") %>% as.vector()
+pred_enet_test  <- predict(cv_enet, X_test,  s = "lambda.1se") %>% as.vector()
+
+metricas_enet <- bind_rows(
+  calc_metricas(y_train, pred_enet_train, "Elastic Net - Train"),
+  calc_metricas(y_test,  pred_enet_test,  "Elastic Net - Test")
+)
+kable(metricas_enet, caption = "Metricas Elastic Net (lambda.1se)")
+
+# Visualizacion de coeficientes seleccionados
+ggplot(coef_enet_df, aes(x = reorder(variable, abs(coeficiente)), y = coeficiente)) +
+  geom_col(fill = ifelse(coef_enet_df$coeficiente > 0, "#2c7fb8", "#d7301f"),
+           alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title    = "Coeficientes seleccionados por Elastic Net",
+    subtitle = "Azul = efecto positivo sobre log_price | Rojo = negativo",
+    x = "", y = "Coeficiente"
+  ) +
+  theme_minimal()
+```
+
+**Analisis:** el Elastic Net combina la penalizacion L1 (Lasso, que lleva coeficientes exactamente a cero) y L2 (Ridge, que los encoge sin eliminarlos). Con `alpha = 0.5`, se logra un balance: seleccion de variables y estabilidad ante multicolinealidad simultaneamente. El `lambda.1se` elige el modelo mas parsimonioso dentro de 1 error estandar del optimo, priorizando interpretabilidad. Las variables con coeficiente distinto de cero son las mas importantes; las que Lasso elimino eran redundantes o no aportaban informacion neta.
+
+---
+
+### 23) Comparacion final de modelos
+```{r comparacion-final}
+# Consolidar todas las metricas
+metricas_todas <- bind_rows(
+  metricas_simple,
+  metricas_mult,
+  metricas_corr,
+  metricas_enet
+)
+
+kable(metricas_todas, caption = "Comparacion de metricas: todos los modelos")
+
+# Grafico comparativo RMSE test
+metricas_test <- metricas_todas %>%
+  filter(grepl("Test", modelo)) %>%
+  mutate(modelo = gsub(" - Test", "", modelo))
+
+ggplot(metricas_test, aes(x = reorder(modelo, RMSE), y = RMSE, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c(
+    "Simple"      = "#a1dab4",
+    "Multiple"    = "#41b6c4",
+    "Corregido"   = "#2c7fb8",
+    "Elastic Net" = "#756bb1"
+  )) +
+  labs(
+    title    = "RMSE en test por modelo (menor = mejor)",
+    subtitle = "Variable respuesta: log_price",
+    x = "", y = "RMSE"
+  ) +
+  theme_minimal()
+
+# Guardar objetos para Parte 3
+save(
+  modelo_simple,
+  modelo_multiple,
+  modelo_corregido,
+  cv_enet,
+  metricas_todas,
+  X_train, y_train,
+  X_test,  y_test,
+  file = "parte3_modelos.RData"
+)
+cat("Objetos guardados en parte3_modelos.RData\n")
+```
+
+**Analisis final de seleccion de modelos:** el modelo simple establece la linea base con R² bajo. El modelo multiple mejora al usar todas las numericas, pero sufre de multicolinealidad. El modelo corregido es el mejor balance: incorpora categoricas clave, elimina redundancias y mantiene interpretabilidad. El Elastic Net tipicamente iguala o supera al corregido en RMSE test porque penaliza el sobreajuste automaticamente y selecciona las variables mas informativas. Los objetos quedan guardados en `parte3_modelos.RData` listos para la comparacion final y evaluacion en Parte 3.
+
+
+
+## PARTE 3 — Evaluación final y conclusiones
+```{r setup-parte3}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(glmnet)
+
+load("parte3_modelos.RData")
+
+calc_metricas <- function(actual, predicted, label = "") {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae  <- mean(abs(actual - predicted))
+  r2   <- cor(actual, predicted)^2
+  tibble(modelo = label, RMSE = round(rmse, 4), MAE = round(mae, 4), R2 = round(r2, 4))
+}
+```
 ### LINK DE GITHUB
 https://github.com/Cisco890/Lab3_DM.git
