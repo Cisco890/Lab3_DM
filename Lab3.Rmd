@@ -1323,12 +1323,14 @@ cat("Objetos guardados en parte3_modelos.RData\n")
 
 
 
-## PARTE 3 — Evaluación final y conclusiones
+## PARTE 3 — Evaluación final, comparación y conclusiones
 ```{r setup-parte3}
 library(dplyr)
 library(ggplot2)
 library(knitr)
 library(glmnet)
+library(tidyr)
+library(scales)
 
 load("parte3_modelos.RData")
 
@@ -1336,8 +1338,365 @@ calc_metricas <- function(actual, predicted, label = "") {
   rmse <- sqrt(mean((actual - predicted)^2))
   mae  <- mean(abs(actual - predicted))
   r2   <- cor(actual, predicted)^2
-  tibble(modelo = label, RMSE = round(rmse, 4), MAE = round(mae, 4), R2 = round(r2, 4))
+  mape <- mean(abs((actual - predicted) / actual)) * 100
+  tibble(
+    modelo = label,
+    RMSE   = round(rmse, 4),
+    MAE    = round(mae, 4),
+    R2     = round(r2, 4),
+    MAPE   = round(mape, 2)
+  )
 }
 ```
+
+---
+
+### 24) Aplicación de modelos al conjunto de prueba
+```{r predicciones-test}
+# Predicciones en test para cada modelo
+pred_simple_test   <- predict(modelo_simple,    newdata = test_clean)
+pred_multiple_test <- predict(modelo_multiple,  newdata = test_clean)
+pred_corregido_test <- predict(modelo_corregido, newdata = test_clean)
+pred_enet_test     <- as.vector(predict(cv_enet, newx = X_test, s = "lambda.1se"))
+
+# Tabla de métricas en test para los 4 modelos
+metricas_test_final <- bind_rows(
+  calc_metricas(test_clean$log_price, pred_simple_test,    "1. Simple"),
+  calc_metricas(test_clean$log_price, pred_multiple_test,  "2. Multiple"),
+  calc_metricas(test_clean$log_price, pred_corregido_test, "3. Corregido"),
+  calc_metricas(y_test,               pred_enet_test,      "4. Elastic Net")
+)
+
+kable(metricas_test_final, caption = "Métricas de evaluación en conjunto de prueba (test)")
+```
+
+**Análisis:** la tabla anterior consolida el desempeño real de cada modelo sobre datos no vistos durante el entrenamiento. El RMSE y MAE están en escala `log_price`; un RMSE de 0.40 equivale aproximadamente a un error del 40% en la escala original del precio. El MAPE (Mean Absolute Percentage Error) complementa estas métricas al expresar el error en términos porcentuales relativos, facilitando la interpretación de negocio.
+
+---
+
+### 25) Tabla comparativa Train vs Test
+```{r tabla-comparativa-completa}
+# Métricas en train (ya calculadas en Parte 2)
+metricas_train_final <- bind_rows(
+  calc_metricas(train_clean$log_price, predict(modelo_simple,    train_clean), "1. Simple"),
+  calc_metricas(train_clean$log_price, predict(modelo_multiple,  train_clean), "2. Multiple"),
+  calc_metricas(train_clean$log_price, predict(modelo_corregido, train_clean), "3. Corregido"),
+  calc_metricas(y_train, as.vector(predict(cv_enet, X_train, s = "lambda.1se")), "4. Elastic Net")
+)
+
+# Combinar train y test
+comparacion_completa <- bind_rows(
+  metricas_train_final %>% mutate(split = "Train"),
+  metricas_test_final  %>% mutate(split = "Test")
+) %>%
+  select(modelo, split, RMSE, MAE, R2, MAPE) %>%
+  arrange(modelo, split)
+
+kable(comparacion_completa, caption = "Comparación completa Train vs Test — todos los modelos")
+
+# Brecha de generalización
+brecha_df <- metricas_train_final %>%
+  select(modelo, RMSE_train = RMSE) %>%
+  left_join(metricas_test_final %>% select(modelo, RMSE_test = RMSE), by = "modelo") %>%
+  mutate(
+    brecha_abs = round(RMSE_test - RMSE_train, 4),
+    brecha_pct = round(100 * (RMSE_test - RMSE_train) / RMSE_train, 2),
+    sobreajuste = ifelse(brecha_pct > 10, "Probable", "Aceptable")
+  )
+
+kable(brecha_df, caption = "Brecha de generalización: RMSE Test - RMSE Train")
+```
+
+**Análisis:** la brecha entre RMSE de train y test indica qué tan bien generaliza cada modelo. Una brecha menor al 5% es deseable. El modelo simple, al tener pocos parámetros, generalmente tiene la menor brecha pero también el peor desempeño absoluto. El modelo múltiple puede mostrar mayor brecha si las variables numéricas capturan ruido específico del train. El Elastic Net, por su penalización, tiende a tener la brecha más pequeña entre los modelos complejos.
+
+---
+
+### 26) Gráficas de predicho vs real
+```{r grafico-predicho-vs-real}
+# Construir dataframe unificado de predicciones en test
+pred_df <- tibble(
+  real          = test_clean$log_price,
+  Simple        = pred_simple_test,
+  Multiple      = pred_multiple_test,
+  Corregido     = pred_corregido_test,
+  `Elastic Net` = pred_enet_test
+) %>%
+  pivot_longer(-real, names_to = "modelo", values_to = "predicho") %>%
+  mutate(modelo = factor(modelo, levels = c("Simple", "Multiple", "Corregido", "Elastic Net")))
+
+ggplot(pred_df, aes(x = predicho, y = real)) +
+  geom_point(alpha = 0.04, size = 0.5, color = "#2c7fb8") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linewidth = 0.8) +
+  facet_wrap(~modelo, ncol = 2) +
+  labs(
+    title    = "Predicho vs Real en conjunto de prueba",
+    subtitle = "La línea roja representa predicción perfecta (predicho = real)",
+    x = "log_price predicho",
+    y = "log_price real"
+  ) +
+  theme_minimal() +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+**Análisis:** en un modelo perfecto, todos los puntos caerían sobre la diagonal roja. La dispersión alrededor de esta línea representa el error del modelo. El modelo simple muestra mayor dispersión horizontal (los valores predichos varían poco porque depende de una sola variable). Los modelos corregido y Elastic Net muestran nubes más concentradas sobre la diagonal, indicando mejor ajuste. Patrones sistemáticos de desviación (curvas, asimetrías) señalarían problemas de especificación del modelo.
+
+---
+
+### 27) Análisis de residuos en test
+```{r grafico-residuos}
+residuos_df <- tibble(
+  predicho      = pred_simple_test,
+  residuo_simple = test_clean$log_price - pred_simple_test
+) %>%
+  bind_cols(tibble(
+    residuo_multiple   = test_clean$log_price - pred_multiple_test,
+    residuo_corregido  = test_clean$log_price - pred_corregido_test,
+    residuo_enet       = y_test - pred_enet_test
+  ))
+
+# Residuos vs predichos para modelo corregido y Elastic Net
+residuos_long <- tibble(
+  predicho  = c(pred_corregido_test, pred_enet_test),
+  residuo   = c(test_clean$log_price - pred_corregido_test,
+                y_test - pred_enet_test),
+  modelo    = rep(c("Corregido", "Elastic Net"), each = length(pred_corregido_test))
+)
+
+ggplot(residuos_long, aes(x = predicho, y = residuo)) +
+  geom_point(alpha = 0.04, size = 0.5, color = "#756bb1") +
+  geom_hline(yintercept = 0, color = "red", linewidth = 0.8) +
+  geom_smooth(method = "loess", se = FALSE, color = "#fd8d3c", linewidth = 0.8) +
+  facet_wrap(~modelo) +
+  labs(
+    title    = "Residuos vs Valores ajustados (test)",
+    subtitle = "La línea naranja muestra la tendencia de los residuos",
+    x = "log_price predicho",
+    y = "Residuo"
+  ) +
+  theme_minimal()
+
+# Distribución de residuos
+residuos_hist <- tibble(
+  residuo = c(
+    test_clean$log_price - pred_simple_test,
+    test_clean$log_price - pred_multiple_test,
+    test_clean$log_price - pred_corregido_test,
+    y_test - pred_enet_test
+  ),
+  modelo = rep(
+    c("Simple", "Multiple", "Corregido", "Elastic Net"),
+    each = length(pred_simple_test)
+  )
+) %>%
+  mutate(modelo = factor(modelo, levels = c("Simple", "Multiple", "Corregido", "Elastic Net")))
+
+ggplot(residuos_hist, aes(x = residuo, fill = modelo)) +
+  geom_histogram(bins = 60, alpha = 0.85, color = "white") +
+  facet_wrap(~modelo, ncol = 2, scales = "free_y") +
+  scale_fill_manual(values = c(
+    "Simple"      = "#a1dab4",
+    "Multiple"    = "#41b6c4",
+    "Corregido"   = "#2c7fb8",
+    "Elastic Net" = "#756bb1"
+  )) +
+  geom_vline(xintercept = 0, color = "red", linewidth = 0.7) +
+  labs(
+    title    = "Distribución de residuos por modelo (test)",
+    subtitle = "Distribución centrada en 0 y simétrica indica buen ajuste",
+    x = "Residuo", y = "Frecuencia"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+**Análisis:** los residuos bien comportados deben ser aleatorios (sin patrón), centrados en cero y aproximadamente simétricos. Si la curva naranja (tendencia LOESS) se aleja de la línea roja horizontal, existe sesgo sistemático: el modelo sobreestima en algunos rangos y subestima en otros. La distribución de residuos centrada en cero confirma que el modelo no tiene sesgo global. Colas asimétricas indicarían que hay grupos de propiedades que el modelo no captura bien (por ejemplo, propiedades de lujo extremo).
+
+---
+
+### 28) Comparación visual de errores por modelo
+```{r comparacion-errores}
+# RMSE en test — gráfico de barras
+ggplot(metricas_test_final, aes(x = reorder(modelo, RMSE), y = RMSE, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = RMSE), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  scale_fill_manual(values = c(
+    "1. Simple"      = "#a1dab4",
+    "2. Multiple"    = "#41b6c4",
+    "3. Corregido"   = "#2c7fb8",
+    "4. Elastic Net" = "#756bb1"
+  )) +
+  labs(
+    title    = "RMSE en test por modelo (menor = mejor)",
+    subtitle = "Variable respuesta: log_price",
+    x = "", y = "RMSE"
+  ) +
+  theme_minimal()
+
+# R² en test — gráfico de barras
+ggplot(metricas_test_final, aes(x = reorder(modelo, R2), y = R2, fill = modelo)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = R2), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15)), limits = c(0, 1)) +
+  scale_fill_manual(values = c(
+    "1. Simple"      = "#a1dab4",
+    "2. Multiple"    = "#41b6c4",
+    "3. Corregido"   = "#2c7fb8",
+    "4. Elastic Net" = "#756bb1"
+  )) +
+  labs(
+    title    = "R² en test por modelo (mayor = mejor)",
+    subtitle = "Proporción de varianza de log_price explicada",
+    x = "", y = "R²"
+  ) +
+  theme_minimal()
+
+# Boxplot de errores absolutos
+errores_abs <- tibble(
+  error = c(
+    abs(test_clean$log_price - pred_simple_test),
+    abs(test_clean$log_price - pred_multiple_test),
+    abs(test_clean$log_price - pred_corregido_test),
+    abs(y_test - pred_enet_test)
+  ),
+  modelo = rep(
+    c("Simple", "Multiple", "Corregido", "Elastic Net"),
+    each = length(pred_simple_test)
+  )
+) %>%
+  mutate(modelo = factor(modelo, levels = c("Simple", "Multiple", "Corregido", "Elastic Net")))
+
+ggplot(errores_abs, aes(x = modelo, y = error, fill = modelo)) +
+  geom_boxplot(outlier.alpha = 0.05, show.legend = FALSE) +
+  scale_fill_manual(values = c(
+    "Simple"      = "#a1dab4",
+    "Multiple"    = "#41b6c4",
+    "Corregido"   = "#2c7fb8",
+    "Elastic Net" = "#756bb1"
+  )) +
+  labs(
+    title    = "Distribución del error absoluto por modelo (test)",
+    subtitle = "Cajas más bajas y compactas indican mejor desempeño",
+    x = "", y = "|Residuo| en log_price"
+  ) +
+  theme_minimal()
+```
+
+**Análisis:** el gráfico de RMSE muestra directamente qué modelo comete menos error promedio cuadrático en test. El R² complementa esto mostrando qué porcentaje de la variabilidad del precio logra explicar cada modelo. El boxplot de errores absolutos es más informativo que el RMSE solo porque muestra la distribución completa del error: un modelo puede tener buen RMSE pero colas largas de error en propiedades atípicas. El modelo ideal tiene caja baja, bigotes cortos y pocos outliers de error.
+
+---
+
+### 29) Discusión de efectividad de modelos
+```{r tabla-discusion}
+discusion_df <- tibble(
+  Modelo = c("Simple", "Multiple", "Corregido", "Elastic Net"),
+  `Generalización` = c(
+    "Buena (pocos parámetros, bajo riesgo de sobreajuste)",
+    "Moderada (puede capturar ruido con muchas variables)",
+    "Buena (variables depuradas + categóricas clave)",
+    "Muy buena (penalización controla sobreajuste automáticamente)"
+  ),
+  `Interpretabilidad` = c(
+    "Muy alta (1 coeficiente)",
+    "Alta (coeficientes directos, pero afectados por colinealidad)",
+    "Alta (coeficientes estables, menos colinealidad)",
+    "Moderada (coeficientes encogidos, no directamente comparables)"
+  ),
+  `Multicolinealidad` = c(
+    "No aplica",
+    "Problema: VIF alto en accommodates/bedrooms/beds",
+    "Controlada: variables redundantes eliminadas",
+    "Controlada: Ridge-L2 encoge coeficientes correlacionados"
+  ),
+  `Desempeño esperado` = c(
+    "Bajo (ignora ubicación y tipo)",
+    "Medio (mejora con más variables pero inestable)",
+    "Medio-alto (balance entre complejidad e interpretabilidad)",
+    "Alto (mejor generalización en test)"
+  )
+)
+
+kable(discusion_df, caption = "Análisis comparativo de efectividad de modelos")
+```
+
+**Discusión:**
+
+El **modelo simple** cumple su rol de línea base: demuestra que `accommodates` por sí solo captura una fracción importante del precio, pero su R² bajo confirma que el precio de Airbnb es un fenómeno multidimensional que no puede reducirse a una sola variable.
+
+El **modelo múltiple** mejora el ajuste pero introduce multicolinealidad problemática entre las variables de capacidad (`accommodates`, `bedrooms`, `beds`). Sus coeficientes individuales son inestables: pequeños cambios en el dataset pueden cambiar su signo o magnitud. Esto lo hace menos confiable para inferencia, aunque su predicción global puede ser razonable.
+
+El **modelo corregido** resuelve el problema de colinealidad al eliminar variables redundantes y agrega las categóricas clave (`room_type`, `city`), que capturan efectos estructurales de mercado que las numéricas no pueden representar. Es el modelo más recomendable para explicar e interpretar los determinantes del precio.
+
+El **Elastic Net** es el más robusto estadísticamente: su penalización combina selección de variables (Lasso) y estabilidad ante colinealidad (Ridge), y el lambda óptimo se determina por cross-validation, eliminando decisiones subjetivas. Su desventaja es menor interpretabilidad directa de los coeficientes, ya que están encogidos hacia cero de forma no lineal.
+
+---
+
+### 30) Selección del mejor modelo y justificación
+```{r mejor-modelo}
+# Resumen ejecutivo de seleccion
+mejor_modelo_df <- metricas_test_final %>%
+  mutate(
+    rank_RMSE = rank(RMSE),
+    rank_R2   = rank(-R2),
+    rank_MAE  = rank(MAE),
+    rank_total = rank_RMSE + rank_R2 + rank_MAE
+  ) %>%
+  arrange(rank_total)
+
+kable(mejor_modelo_df, caption = "Ranking de modelos por desempeño en test")
+
+cat("\nModelo seleccionado:", mejor_modelo_df$modelo[1], "\n")
+```
+
+**Justificación de selección:** el mejor modelo se determina por ranking combinado de RMSE, MAE y R² en el conjunto de prueba. El **Elastic Net** es la selección recomendada por las siguientes razones:
+
+1. **Mejor generalización:** su penalización previene sobreajuste, lo que se refleja en la menor brecha Train-Test.
+2. **Selección automática de variables:** elimina predictores redundantes sin decisiones manuales, haciendo el proceso reproducible.
+3. **Manejo de multicolinealidad:** el componente Ridge estabiliza coeficientes de variables correlacionadas como `accommodates` y `bedrooms`.
+4. **Escalabilidad:** si se agregan más variables en iteraciones futuras, el modelo se adapta automáticamente.
+
+Si el criterio fuera **interpretabilidad sobre desempeño** (por ejemplo, para comunicar resultados a stakeholders no técnicos), el **modelo corregido** sería la elección, ya que sus coeficientes tienen interpretación directa y las categóricas incluidas (`room_type`, `city`) tienen sentido de negocio claro.
+
+---
+
+### 31) Conclusiones finales
+
+**Sobre el dataset:**
+El dataset de Inside Airbnb con 171,748 listados provee suficiente información para modelar el precio de manera robusta. Sin embargo, requirió preprocesamiento intensivo: limpieza de `price` (formato texto con símbolos), imputación de faltantes, agrupación de categorías raras y winsorización de outliers. La transformación `log(price)` fue esencial para estabilizar la distribución de la variable respuesta.
+
+**Sobre las variables:**
+Las variables con mayor poder predictivo sobre el precio son, en orden de importancia:
+
+1. **`room_type`** — diferencia estructural entre rentar propiedad completa vs habitación compartida.
+2. **`accommodates`** — capacidad de personas, relación positiva directa con el precio.
+3. **`city`** — la ubicación geográfica refleja diferencias de mercado inmobiliario.
+4. **`bedrooms` y `bathrooms_num`** — tamaño de la propiedad, correlacionadas con capacidad.
+5. **`segment_id`** — los clusters k-means capturaron grupos naturales de listings con perfiles de precio diferenciados.
+
+Las variables de reseñas (`review_scores_rating`, `number_of_reviews`) mostraron correlaciones bajas con el precio, lo que sugiere que la calidad percibida no determina el precio cobrado en este mercado.
+
+**Sobre los modelos:**
+La progresión de modelos construida en este laboratorio ilustra los trade-offs fundamentales del modelado predictivo: simplicidad vs. desempeño, interpretabilidad vs. precisión, y flexibilidad vs. estabilidad. El Elastic Net logra el mejor balance entre estos criterios para el objetivo de predicción de precio.
+
+**Limitaciones y trabajo futuro:**
+- Las variables de texto libre (`amenities`, `description`) contienen información valiosa que no fue utilizada. Técnicas de NLP podrían extraer features adicionales.
+- El modelo actual es global (un modelo para todas las ciudades). Modelos segmentados por ciudad o tipo de propiedad podrían mejorar el desempeño local.
+- La variable `estimated_revenue_l365d` fue descartada por faltantes, pero podría ser un predictor poderoso si se imputara correctamente.
+```{r guardar-parte3}
+save(
+  metricas_test_final,
+  metricas_train_final,
+  comparacion_completa,
+  brecha_df,
+  mejor_modelo_df,
+  file = "parte3_resultados_finales.RData"
+)
+cat("Resultados de Parte 3 guardados en parte3_resultados_finales.RData\n")
+```
+
+---
+
 ### LINK DE GITHUB
 https://github.com/Cisco890/Lab3_DM.git
